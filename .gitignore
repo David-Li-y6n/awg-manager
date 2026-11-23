@@ -1,0 +1,7 @@
+# 交付目录含真实客户端私钥与二维码，绝不进仓库
+delivered/
+# Python 缓存
+__pycache__/
+*.pyc
+# 本地测试状态
+*.log

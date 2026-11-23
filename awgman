@@ -1,0 +1,1321 @@
+#!/bin/bash
+# awgman — AmneziaWG 3.1 命令行管理工具
+# 官方原生 AWG 3.1，无 WEB 面板；管理体验模仿 Netmaker。
+# 用法：
+#   awgman            进入全屏彩色 TUI 菜单
+#   awgman <命令> ...  非交互 CLI（供脚本与测试使用），见 cmd_help
+#
+# 状态文件：/root/awg/state.json（唯一事实来源，0600）
+# 客户端配置：/root/awg/clients/<名>.conf + <名>.png（二维码）
+# 服务端配置：/etc/amnezia/amneziawg/awg0.conf（由状态文件生成）
+#
+# 设计要点：
+# - 每次改动后重新生成服务端配置并重启 awg-quick@awg0（1-2 秒中断，
+#   客户端自动重握手）；状态文件是唯一事实来源，避免双源漂移。
+# - 客户端 IP 墓碑制：分配过的 IP 永久记录，删除后也不复用。
+# - I1-I5 只写有值的行，绝不写空行（空行会让 awg-quick 在启动时崩溃，
+#   见 amneziawg-tools issue #40）。
+
+set -u
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+VERSION="1.0.0"
+IFACE="awg0"
+STATE_DIR="/root/awg"
+STATE_FILE="$STATE_DIR/state.json"
+CLIENT_DIR="$STATE_DIR/clients"
+SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+LOCK_FILE="$STATE_DIR/.lock"
+BACKUP_DIR="$STATE_DIR/backups"
+
+# ---------- whiptail 配色 ----------
+export NEWT_COLORS='
+root=white,black
+roottext=lightgray,black
+border=cyan,black
+window=white,black
+shadow=black,black
+title=brightcyan,black
+button=black,white
+actbutton=white,blue
+compactbutton=black,white
+checkbox=cyan,black
+actcheckbox=white,blue
+entry=white,blue
+disentry=gray,black
+label=white,black
+listbox=white,black
+actlistbox=white,blue
+textbox=white,black
+acttextbox=white,black
+sellistbox=white,black
+actsellistbox=white,blue
+helpscreen=white,red
+emptyscale=gray,black
+fullscale=white,blue
+'
+
+# ---------- 通用 ----------
+die() { echo "错误：$*" >&2; exit 1; }
+warn() { echo "警告：$*" >&2; }
+
+need_root() {
+    [[ $EUID -eq 0 ]] || die "请用 root 运行（sudo awgman）"
+}
+
+need_state() {
+    [[ -f "$STATE_FILE" ]] || die "状态文件不存在：$STATE_FILE。请先运行 install.sh 安装服务端。"
+    jq -e . "$STATE_FILE" >/dev/null 2>&1 || die "状态文件损坏，无法解析：$STATE_FILE"
+}
+
+# 互斥锁：同一时间只允许一个 awgman 运行（保护状态文件）
+take_lock() {
+    mkdir -p "$STATE_DIR"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "已有另一个 awgman 在运行"
+}
+
+# ---------- 状态文件操作（jq） ----------
+# state_get <jq表达式>：输出原始字符串
+state_get() { jq -r "$1" "$STATE_FILE"; }
+
+# state_set <jq程序> [jq参数...]：原子写回
+state_set() {
+    local tmp
+    tmp=$(mktemp) || die "无法创建临时文件"
+    if jq "$@" "$STATE_FILE" >"$tmp"; then
+        mv "$tmp" "$STATE_FILE"
+        chmod 600 "$STATE_FILE"
+    else
+        rm -f "$tmp"
+        die "状态文件写入失败"
+    fi
+}
+
+server_field() { state_get ".server.$1"; }
+subnet_prefix() { server_field subnet | sed -E 's#^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/[0-9]+$#\1#'; }
+server_ip() { server_field server_ip; }
+
+# 随机端口（10000-60000）与随机 CGNAT 网段（100.64.0.0/10 内的 /24）
+rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((10000 + RANDOM % 50001)); }
+rand_subnet() { echo "100.$((64 + RANDOM % 64)).$((RANDOM % 256)).0/24"; }
+
+# ---------- 密钥 ----------
+gen_keypair() {
+    # 输出两行：私钥 / 公钥
+    local priv pub
+    priv=$(awg genkey) || die "awg genkey 失败"
+    pub=$(printf '%s' "$priv" | awg pubkey) || die "awg pubkey 失败"
+    printf '%s\n%s\n' "$priv" "$pub"
+}
+
+gen_psk() {
+    # 32 字节 base64 密钥（用于 HeaderProtectionKey）
+    if command -v awg >/dev/null 2>&1; then
+        awg genpsk
+    else
+        head -c 32 /dev/urandom | base64 -w0
+    fi
+}
+
+rand_int() { # rand_int <min> <max>：均匀随机整数
+    local min=$1 max=$2
+    local range=$((max - min + 1))
+    echo $((min + RANDOM % range))
+}
+
+# ---------- IP 分配（墓碑制） ----------
+# 自动分配：从 .2 起扫描，取从未分配过的最小 IP。
+# 墓碑 = .tombstones[]（已删除客户端的旧 IP），永不自动复用。
+next_free_ip() {
+    local prefix used i
+    prefix=$(subnet_prefix)
+    used=$(jq -r '.clients[].ip, .tombstones[].ip' "$STATE_FILE" 2>/dev/null \
+        | sed -n "s#^${prefix//./\\.}\\.##p" | sort -n | uniq)
+    for i in $(seq 2 253); do
+        if ! grep -qx "$i" <<<"$used"; then
+            echo "$prefix.$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 校验自定义 IP：返回 0 可用；返回 1 格式错；返回 2 已被占用（打印占用者到 stderr）
+check_custom_ip() {
+    local ip=$1 prefix last who
+    prefix=$(subnet_prefix)
+    if ! [[ "$ip" =~ ^${prefix//./\\.}\.([0-9]{1,3})$ ]]; then
+        echo "IP 必须在网段 $prefix.0/24 内" >&2
+        return 1
+    fi
+    last=${BASH_REMATCH[1]}
+    if (( last < 1 || last > 253 )); then
+        echo "主机位必须在 1-253 之间（.0 网络地址、.254 服务端、.255 广播不可用）" >&2
+        return 1
+    fi
+    who=$(jq -r --arg ip "$ip" \
+        '.clients[] | select(.ip == $ip) | .name + "（" + (.remark // "无备注") + "）"' "$STATE_FILE")
+    if [[ -n "$who" ]]; then
+        echo "该 IP 正被客户端 $who 占用" >&2
+        return 2
+    fi
+    return 0
+}
+
+# 该 IP 是否是已删除客户端的旧 IP（墓碑）；是则打印旧信息并返回 0
+tombstone_info() {
+    local ip=$1
+    jq -r --arg ip "$ip" \
+        '.tombstones[] | select(.ip == $ip) | .name + "（" + (.remark // "无备注") + "），删除于 " + .deleted' \
+        "$STATE_FILE"
+}
+
+# ---------- 客户端名校验 ----------
+# 名称会成为 Linux 网卡名（awg-quick@<名>）与 Windows 服务名后缀，
+# 故限制：字母数字开头，仅含字母数字、下划线、连字符，最长 15 字符。
+valid_name() {
+    local name=$1
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,14}$ ]]
+}
+
+client_exists() {
+    jq -e --arg n "$1" '.clients[] | select(.name == $n)' "$STATE_FILE" >/dev/null 2>&1
+}
+
+# ---------- 混淆参数 ----------
+# 生成一套 3.1 混淆参数（JSON），安装时与"重新生成"时调用。
+# 约束（见调研）：
+# - HeaderProtectionKey 要求 S1-S4 全部 >= 12；S4 <= 32。
+# - RandomTrailers=on 时推荐 S1=S2=S3=S4，故四者取同一个随机值 12-20
+#   （12 是 HeaderProtection nonce 下限，20 是无分片上限）。
+# - 启用 HeaderProtectionKey 时 H1-H4 推荐用标准值 1/2/3/4
+#   （自定义头机制关闭，消息类型改由 Header Protection 隐藏）。
+# - I1 只填一个随机长度签名包；I2-I5 一律不写（空行会崩 awg-quick）。
+gen_obfuscation_json() {
+    local s hpk jc jmin jmax i1len
+    s=$(rand_int 12 20)
+    hpk=$(gen_psk)
+    jc=$(rand_int 4 8)
+    jmin=$(rand_int 40 80)
+    jmax=$(rand_int 150 300)
+    i1len=$(rand_int 32 148)
+    jq -n \
+        --argjson Jc "$jc" --argjson Jmin "$jmin" --argjson Jmax "$jmax" \
+        --argjson S1 "$s" --argjson S2 "$s" --argjson S3 "$s" --argjson S4 "$s" \
+        --argjson H1 1 --argjson H2 2 --argjson H3 3 --argjson H4 4 \
+        --arg I1 "<r $i1len>" \
+        --arg HeaderProtectionKey "$hpk" \
+        --arg ContentPaddingAddition "16-64" \
+        --arg RekeyAfterTime "120-180" \
+        --arg RekeyTimeout "5-10" \
+        --arg RejectAfterTime "180-240" \
+        --arg KeepaliveTimeout "10-15" \
+        --arg MaxHandshakeAttempts "12-18" \
+        --arg RandomTrailers "on" \
+        --arg DisableCookies "off" \
+        '{Jc: $Jc, Jmin: $Jmin, Jmax: $Jmax, S1: $S1, S2: $S2, S3: $S3, S4: $S4,
+          H1: $H1, H2: $H2, H3: $H3, H4: $H4, I1: $I1,
+          HeaderProtectionKey: $HeaderProtectionKey,
+          ContentPaddingAddition: $ContentPaddingAddition,
+          RekeyAfterTime: $RekeyAfterTime, RekeyTimeout: $RekeyTimeout,
+          RejectAfterTime: $RejectAfterTime, KeepaliveTimeout: $KeepaliveTimeout,
+          MaxHandshakeAttempts: $MaxHandshakeAttempts,
+          RandomTrailers: $RandomTrailers, DisableCookies: $DisableCookies}'
+}
+
+# 打印混淆参数的配置行（服务端与客户端共用，两端必须一致）
+obfuscation_conf_lines() {
+    local o
+    o=$(state_get '.server.obfuscation')
+    jq -r 'to_entries[] | select(.value != null and .value != "") | "\(.key) = \(.value)"' <<<"$o"
+}
+
+# ---------- 配置文件生成 ----------
+write_server_config() {
+    # 从状态文件重新生成服务端配置（唯一事实来源）
+    local priv addr port mtu ext_if
+    priv=$(server_field private_key)
+    addr=$(server_ip)
+    port=$(server_field port)
+    mtu=$(server_field mtu)
+    ext_if=$(server_field ext_if)
+    mkdir -p "$(dirname "$SERVER_CONF")"
+    {
+        echo "[Interface]"
+        echo "PrivateKey = $priv"
+        echo "Address = $addr/32"
+        echo "ListenPort = $port"
+        echo "MTU = $mtu"
+        obfuscation_conf_lines
+        echo "PostUp = iptables -A FORWARD -i $IFACE -j ACCEPT; iptables -A FORWARD -o $IFACE -j ACCEPT; iptables -t nat -A POSTROUTING -o $ext_if -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i $IFACE -j ACCEPT; iptables -D FORWARD -o $IFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o $ext_if -j MASQUERADE"
+        echo ""
+        # 已启用的客户端（禁用的不写入，等于撤销接入）
+        jq -r '.clients[] | select(.enabled == true) |
+            "[Peer]\n# \(.name)\(.remark | if . != "" then " " + . else "" end)\nPublicKey = \(.public_key)\nAllowedIPs = \(.ip)/32\n"' \
+            "$STATE_FILE"
+    } >"$SERVER_CONF"
+    chmod 600 "$SERVER_CONF"
+}
+
+write_client_config() {
+    # write_client_config <名>：生成 .conf + 二维码 PNG
+    local name=$1 c priv ip full dns endpoint port subnet server_pub mtu
+    c=$(jq -c --arg n "$name" '.clients[] | select(.name == $n)' "$STATE_FILE")
+    [[ -n "$c" ]] || die "客户端不存在：$name"
+    priv=$(jq -r '.private_key' <<<"$c")
+    ip=$(jq -r '.ip' <<<"$c")
+    full=$(jq -r '.full_tunnel' <<<"$c")
+    dns=$(server_field dns)
+    endpoint=$(server_field endpoint)
+    port=$(server_field port)
+    subnet=$(server_field subnet)
+    server_pub=$(server_field public_key)
+    mtu=$(server_field mtu)
+    local remark conf png
+    remark=$(jq -r '.remark // ""' <<<"$c")
+    conf="$CLIENT_DIR/$name.conf"
+    png="$CLIENT_DIR/$name.png"
+    mkdir -p "$CLIENT_DIR"
+    chmod 700 "$CLIENT_DIR"
+    {
+        echo "# $name"
+        [[ -n "$remark" ]] && echo "# 备注：$remark"
+        echo "# 内网地址：$ip"
+        echo "[Interface]"
+        echo "PrivateKey = $priv"
+        echo "Address = $ip/32"
+        echo "MTU = $mtu"
+        if [[ "$full" == "true" ]]; then
+            echo "DNS = $dns"
+        fi
+        obfuscation_conf_lines
+        echo ""
+        echo "[Peer]"
+        echo "PublicKey = $server_pub"
+        echo "Endpoint = $endpoint:$port"
+        if [[ "$full" == "true" ]]; then
+            echo "AllowedIPs = 0.0.0.0/0"
+        else
+            echo "AllowedIPs = $subnet"
+        fi
+        echo "PersistentKeepalive = 25"
+    } >"$conf"
+    chmod 600 "$conf"
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -o "$png" <"$conf" 2>/dev/null && chmod 600 "$png" || rm -f "$png"
+    fi
+    write_install_scripts "$name"
+    echo "$conf"
+}
+
+# 为客户端生成一键安装脚本（与 .conf 放同一目录，脚本自动找同目录下的 .conf，
+# 避免在菜单弹窗里复制长命令时换行、带边框字符的问题）
+write_install_scripts() {
+    # 注意：local 的多个赋值在同一行时，RHS 在赋值前统一展开；set -u 下
+    # $name 尚未绑定会报错，故分开写
+    local name=$1 sh ps
+    sh="$CLIENT_DIR/$name-install.sh"
+    ps="$CLIENT_DIR/$name-install.ps1"
+    cat >"$sh" <<EOF
+#!/usr/bin/env bash
+# $name 的 AWG 客户端一键安装（Linux）
+# 用法：把 $name.conf 和本文件传到客户端同一目录，执行：sudo bash $name-install.sh
+# 未装 amneziawg-tools 时自动从官方 PPA 安装（Debian 12/13、Ubuntu 22.04/24.04）
+set -e
+NAME="$name"
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+[[ \$EUID -eq 0 ]] || { echo "请用 root 运行：sudo bash \$0"; exit 1; }
+[[ -f "\$DIR/\$NAME.conf" ]] || { echo "找不到 \$DIR/\$NAME.conf，请把配置文件和本脚本放同一目录"; exit 1; }
+if ! command -v awg-quick >/dev/null 2>&1; then
+    echo "未检测到 amneziawg-tools，正在从官方 PPA 安装..."
+    . /etc/os-release
+    case "\$ID" in
+        debian) [[ "\$VERSION_ID" == "13" ]] && SUITE=noble || SUITE=jammy ;;
+        ubuntu) [[ "\$VERSION_ID" == "24.04" ]] && SUITE=noble || SUITE=jammy ;;
+        *) echo "不支持的系统：\$ID \$VERSION_ID（仅支持 Debian 12/13、Ubuntu 22.04/24.04）"; exit 1 ;;
+    esac
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq curl ca-certificates
+    apt-get install -y -qq "linux-headers-\$(uname -r)" 2>/dev/null || echo "注意：内核头文件安装失败，DKMS 可能无法编译"
+    mkdir -p /etc/apt/keyrings
+    curl --retry 3 -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x75C9DD72C799870E310542E24166F2C257290828" -o /etc/apt/keyrings/amnezia.asc
+    echo "deb [signed-by=/etc/apt/keyrings/amnezia.asc] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu \$SUITE main" > /etc/apt/sources.list.d/amnezia.list
+    apt-get update -qq
+    apt-get install -y amneziawg-tools amneziawg-dkms
+    modprobe amneziawg 2>/dev/null || echo "注意：内核模块加载失败，awg-quick 将尝试用户态模式"
+    command -v awg-quick >/dev/null 2>&1 || { echo "amneziawg-tools 安装失败"; exit 1; }
+    echo "amneziawg-tools 已安装"
+fi
+mkdir -p /etc/amnezia/amneziawg
+install -m 600 "\$DIR/\$NAME.conf" "/etc/amnezia/amneziawg/\$NAME.conf"
+systemctl enable --now "awg-quick@\$NAME"
+sleep 1
+if systemctl is-active --quiet "awg-quick@\$NAME"; then
+    echo "已安装并启动：awg-quick@\$NAME（开机自动连接）"
+else
+    echo "服务启动失败：systemctl status awg-quick@\$NAME"
+    exit 1
+fi
+EOF
+    chmod 755 "$sh"
+    cat >"$ps" <<EOF
+# $name 的 AWG 客户端一键安装（Windows）
+# 用法：把 $name.conf 和本文件放同一目录，以管理员身份运行 PowerShell，执行：.\\$name-install.ps1
+# 要求：已安装官方 AmneziaWG Windows 客户端
+\$ErrorActionPreference = "Stop"
+\$conf = Join-Path \$PSScriptRoot "$name.conf"
+if (-not (Test-Path \$conf)) { Write-Error "找不到 \$conf，请把配置文件和本脚本放同一目录"; exit 1 }
+\$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not \$isAdmin) { Write-Error "请以管理员身份运行 PowerShell"; exit 1 }
+\$exe = (Get-Command amneziawg.exe -ErrorAction SilentlyContinue).Source
+if (-not \$exe) { \$exe = "C:\Program Files\AmneziaWG\amneziawg.exe" }
+if (-not (Test-Path \$exe)) { Write-Error "找不到 amneziawg.exe，请先安装官方 AmneziaWG Windows 客户端"; exit 1 }
+& \$exe /installtunnelservice \$conf
+Write-Host "已安装隧道服务 AmneziaWGTunnel\$$name（开机自动连接）"
+EOF
+    chmod 644 "$ps"
+}
+
+regen_all_client_configs() {
+    local n
+    while IFS= read -r n; do
+        write_client_config "$n" >/dev/null
+    done < <(jq -r '.clients[].name' "$STATE_FILE")
+}
+
+# 打印某客户端的一键安装方法（配置与安装脚本在 $CLIENT_DIR 下，用户下载到
+# 客户端后本地执行；主推安装脚本法，一条短命令，不怕弹窗换行带边框）
+print_install_commands() {
+    local name=$1
+    echo "一键安装（推荐）：下载 $name.conf 与安装脚本到客户端同一目录"
+    echo "  Linux：sudo bash $name-install.sh"
+    echo "  Windows（管理员 PowerShell）：.\\$name-install.ps1"
+    echo ""
+    echo "手动命令（配置已上传到客户端后执行）："
+    echo "  Windows：amneziawg.exe /installtunnelservice <配置路径>"
+    echo "  Linux：sudo cp <配置路径> /etc/amnezia/amneziawg/"
+    echo "         sudo systemctl enable --now awg-quick@$name"
+    echo ""
+    echo "手机：用 AmneziaVPN 扫描 $CLIENT_DIR/$name.png 二维码"
+}
+
+# ---------- 服务控制 ----------
+restart_awg() {
+    systemctl restart "awg-quick@$IFACE" || die "awg-quick@$IFACE 重启失败，请查看日志：journalctl -u awg-quick@$IFACE"
+    sleep 1
+    systemctl is-active --quiet "awg-quick@$IFACE" || die "awg-quick@$IFACE 未能保持运行，请查看日志"
+}
+
+awg_is_active() { systemctl is-active --quiet "awg-quick@$IFACE" 2>/dev/null; }
+
+# ---------- 状态解析 ----------
+# 解析 `awg show awg0 dump`，输出每行：公钥<TAB>最后握手时间戳<TAB>接收字节<TAB>发送字节<TAB>对端地址
+peer_dump() {
+    awg show "$IFACE" dump 2>/dev/null | tail -n +2
+}
+
+# 某公钥的状态：输出 "握手秒数前|接收|发送|对端"，无记录则输出空
+peer_status_of() {
+    local pub=$1 now line hs rx tx ep
+    now=$(date +%s)
+    line=$(peer_dump | awk -F'\t' -v p="$pub" '$1 == p {print; exit}')
+    [[ -z "$line" ]] && return 1
+    hs=$(awk -F'\t' '{print $5}' <<<"$line")
+    rx=$(awk -F'\t' '{print $6}' <<<"$line")
+    tx=$(awk -F'\t' '{print $7}' <<<"$line")
+    ep=$(awk -F'\t' '{print $3}' <<<"$line")
+    if [[ "$hs" == "0" ]]; then
+        echo "never|$rx|$tx|$ep"
+    else
+        echo "$((now - hs))|$rx|$tx|$ep"
+    fi
+}
+
+fmt_bytes() {
+    local b=$1
+    if (( b >= 1073741824 )); then printf '%.1f GB' "$(awk "BEGIN{print $b/1073741824}")"
+    elif (( b >= 1048576 )); then printf '%.1f MB' "$(awk "BEGIN{print $b/1048576}")"
+    elif (( b >= 1024 )); then printf '%.1f KB' "$(awk "BEGIN{print $b/1024}")"
+    else printf '%d B' "$b"; fi
+}
+
+fmt_ago() {
+    local s=$1
+    if [[ "$s" == "never" ]]; then echo "从未连接"
+    elif (( s < 60 )); then echo "${s} 秒前"
+    elif (( s < 3600 )); then echo "$((s / 60)) 分钟前"
+    elif (( s < 86400 )); then echo "$((s / 3600)) 小时前"
+    else echo "$((s / 86400)) 天前"; fi
+}
+
+# ---------- 拓扑 ----------
+topology_text() {
+    local subnet srv_ip line name remark ip pub enabled full st ago rx tx status mode
+    local total active online=0
+    subnet=$(server_field subnet)
+    srv_ip=$(server_ip)
+    total=$(jq -r '.clients | length' "$STATE_FILE")
+    active=$(jq -r '[.clients[] | select(.enabled == true)] | length' "$STATE_FILE")
+    # 分隔线宽度随对话框走（WT_W 由 wt_size 维护，CLI 下为默认 72）
+    local w=$((WT_W - 6))
+    (( w < 40 )) && w=40
+    local sep
+    # 注意：tr 按字节处理多字节字符会把 ─ 截成单字节 E2，改用 printf 循环
+    sep=$(printf '─%.0s' $(seq 1 "$w"))
+    echo "AWG 星型拓扑 · 所有客户端流量经服务端中转"
+    echo "网段 $subnet　服务端 $srv_ip　端口 $(server_field port)/udp"
+    echo "$sep"
+    echo ""
+    echo "  ★ S　$srv_ip　[服务端]"
+    if (( total == 0 )); then
+        echo "  │"
+        echo "  └── （暂无客户端）"
+        echo ""
+        echo "$sep"
+        echo "客户端：0 个"
+        return 0
+    fi
+    echo "  │"
+    local i=0
+    while IFS=$'\t' read -r name remark ip pub enabled full; do
+        i=$((i + 1))
+        local branch="├──"
+        (( i == total )) && branch="└──"
+        local dot="○"
+        if [[ "$enabled" != "true" ]]; then
+            status="已禁用"
+            dot="⊘"
+        elif st=$(peer_status_of "$pub" 2>/dev/null); then
+            ago=$(cut -d'|' -f1 <<<"$st"); rx=$(cut -d'|' -f2 <<<"$st"); tx=$(cut -d'|' -f3 <<<"$st")
+            if [[ "$ago" == "never" ]]; then
+                status="离线 · 从未连接"
+            elif (( ago < 180 )); then
+                status="在线 · $(fmt_ago "$ago")握手 · ↓$(fmt_bytes "$rx") ↑$(fmt_bytes "$tx")"
+                dot="●"
+                online=$((online + 1))
+            else
+                status="离线 · 最后握手 $(fmt_ago "$ago")"
+            fi
+        else
+            status="离线 · 无握手记录"
+        fi
+        mode="分流"
+        [[ "$full" == "true" ]] && mode="全量"
+        line="  $branch $dot $name　$ip　$mode"
+        [[ -n "$remark" ]] && line="$line　$remark"
+        line="$line　[$status]"
+        echo "$line"
+    done < <(jq -r '.clients[] | [.name, (.remark // ""), .ip, .public_key, (.enabled | tostring), (.full_tunnel | tostring)] | @tsv' "$STATE_FILE")
+    echo ""
+    echo "$sep"
+    echo "客户端：$total 个（启用 $active，禁用 $((total - active))）· 在线 $online 个"
+}
+
+# ---------- 客户端操作（核心，可供 CLI 与 TUI 共用） ----------
+# add_client <名> <备注> <ip|auto> <full:true|false> <force:0|1>
+# 返回码：0 成功；1 参数/校验失败；3 该 IP 是已删除客户端的旧 IP，需确认（force=1 可跳过）
+add_client() {
+    local name=$1 remark=$2 ip_req=$3 full=$4 force=${5:-0}
+    # 备注会写入配置文件的注释行，换行符会破坏配置格式，故替换为空格
+    remark=${remark//$'\n'/ }
+    remark=${remark//$'\r'/}
+    local ip keys priv pub created tomb
+    valid_name "$name" || { echo "名称不合法：须以字母数字开头，仅含字母、数字、下划线、连字符，最长 15 字符" >&2; return 1; }
+    client_exists "$name" && { echo "客户端已存在：$name" >&2; return 1; }
+    if [[ "$ip_req" == "auto" ]]; then
+        ip=$(next_free_ip) || { echo "地址池已耗尽（.2-.253 全部分配过），请用「释放已删除客户端的 IP」清理墓碑" >&2; return 1; }
+    else
+        check_custom_ip "$ip_req" || return 1
+        tomb=$(tombstone_info "$ip_req")
+        if [[ -n "$tomb" && "$force" != "1" ]]; then
+            echo "TOMBSTONE:$tomb" >&2
+            return 3
+        fi
+        ip=$ip_req
+    fi
+    keys=$(gen_keypair) || die "密钥生成失败"
+    priv=$(head -n1 <<<"$keys")
+    pub=$(tail -n1 <<<"$keys")
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    state_set --arg n "$name" --arg r "$remark" --arg ip "$ip" \
+        --arg priv "$priv" --arg pub "$pub" --argjson full "$full" --arg c "$created" \
+        '.clients += [{name:$n, remark:$r, ip:$ip, private_key:$priv, public_key:$pub,
+                       enabled:true, full_tunnel:$full, created:$c}]
+         | .tombstones |= map(select(.ip != $ip))'
+    write_server_config
+    restart_awg
+    write_client_config "$name" >/dev/null
+    echo "已添加客户端 $name（$ip）"
+    echo "配置：$CLIENT_DIR/$name.conf"
+}
+
+# del_client <名>：删除客户端，IP 记入墓碑（永不自动复用），删除其配置文件
+del_client() {
+    local name=$1 c ip remark
+    client_exists "$name" || { echo "客户端不存在：$name" >&2; return 1; }
+    c=$(jq -c --arg n "$name" '.clients[] | select(.name == $n)' "$STATE_FILE")
+    ip=$(jq -r '.ip' <<<"$c")
+    remark=$(jq -r '.remark // ""' <<<"$c")
+    state_set --arg n "$name" --arg ip "$ip" --arg r "$remark" \
+        --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.clients |= map(select(.name != $n))
+         | .tombstones += [{ip:$ip, name:$n, remark:$r, deleted:$d}]'
+    rm -f "$CLIENT_DIR/$name.conf" "$CLIENT_DIR/$name.png" \
+        "$CLIENT_DIR/$name-install.sh" "$CLIENT_DIR/$name-install.ps1"
+    write_server_config
+    restart_awg
+    echo "已删除客户端 $name，其 IP $ip 已记入墓碑（不再自动分配）"
+}
+
+set_client_enabled() {
+    # set_client_enabled <名> <true|false>
+    local name=$1 en=$2
+    client_exists "$name" || { echo "客户端不存在：$name" >&2; return 1; }
+    state_set --arg n "$name" --argjson en "$en" \
+        '.clients |= map(if .name == $n then .enabled = $en else . end)'
+    write_server_config
+    restart_awg
+    if [[ "$en" == "true" ]]; then echo "已启用客户端 $name"; else echo "已禁用客户端 $name（服务端已撤销其接入）"; fi
+}
+
+set_client_remark() {
+    # set_client_remark <名> <备注>：只改备注与配置文件注释，不重启服务
+    local name=$1 remark=$2
+    remark=${remark//$'\n'/ }
+    remark=${remark//$'\r'/}
+    client_exists "$name" || { echo "客户端不存在：$name" >&2; return 1; }
+    state_set --arg n "$name" --arg r "$remark" \
+        '.clients |= map(if .name == $n then .remark = $r else . end)'
+    write_server_config
+    write_client_config "$name" >/dev/null
+    echo "已修改 $name 的备注为：$remark"
+}
+
+set_client_tunnel() {
+    # set_client_tunnel <名> <true|false>：全量/分流切换，只重生成该客户端配置
+    local name=$1 full=$2
+    client_exists "$name" || { echo "客户端不存在：$name" >&2; return 1; }
+    state_set --arg n "$name" --argjson f "$full" \
+        '.clients |= map(if .name == $n then .full_tunnel = $f else . end)'
+    write_client_config "$name" >/dev/null
+    if [[ "$full" == "true" ]]; then echo "已将 $name 改为全量（全部流量走隧道，推送 DNS）"; else echo "已将 $name 改为分流（仅内网网段走隧道）"; fi
+    echo "请重新下载 $CLIENT_DIR/$name.conf 并重新导入客户端"
+}
+
+regen_client_keys() {
+    # regen_client_keys <名>：重新生成密钥对（配置泄露时用）
+    local name=$1 keys priv pub
+    client_exists "$name" || { echo "客户端不存在：$name" >&2; return 1; }
+    keys=$(gen_keypair) || die "密钥生成失败"
+    priv=$(head -n1 <<<"$keys")
+    pub=$(tail -n1 <<<"$keys")
+    state_set --arg n "$name" --arg priv "$priv" --arg pub "$pub" \
+        '.clients |= map(if .name == $n then .private_key = $priv | .public_key = $pub else . end)'
+    write_server_config
+    restart_awg
+    write_client_config "$name" >/dev/null
+    echo "已重新生成 $name 的密钥，请重新下载配置并重新导入客户端（旧配置已失效）"
+}
+
+release_tombstones() {
+    local n
+    n=$(jq -r '.tombstones | length' "$STATE_FILE")
+    state_set '.tombstones = []'
+    echo "已释放 $n 个墓碑 IP，它们可再次自动分配"
+}
+
+# ---------- 网络操作 ----------
+set_port() {
+    local port=$1 old
+    if [[ "$port" == "random" ]]; then
+        port=$(rand_port)
+        echo "随机生成端口：$port" >&2
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || { echo "端口须为 1-65535 的数字" >&2; return 1; }
+    old=$(server_field port)
+    [[ "$port" == "$old" ]] && { echo "端口已是 $port，无需修改"; return 0; }
+    if (( port < 1024 )); then
+        echo "注意：$port 是特权端口（<1024），可能与系统服务冲突" >&2
+    fi
+    if [[ "$port" == "22222" ]]; then
+        echo "注意：22222 是 SSH 端口，AWG 与 SSH 共用端口会冲突" >&2
+        return 1
+    fi
+    state_set --argjson p "$port" '.server.port = $p'
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "$old/udp" >/dev/null 2>&1 || true
+        ufw allow "$port/udp" >/dev/null 2>&1
+        echo "ufw：已删除 $old/udp，放行 $port/udp"
+    fi
+    write_server_config
+    restart_awg
+    regen_all_client_configs
+    echo "监听端口已改为 $port/udp，全部客户端配置已重新生成，请重新下载并导入"
+}
+
+set_subnet() {
+    # set_subnet <新网段，如 100.64.12.0/24 | random>：保留各客户端主机位，墓碑清空
+    local new=$1 prefix old_prefix
+    if [[ "$new" == "random" ]]; then
+        new=$(rand_subnet)
+        echo "随机生成网段：$new" >&2
+    fi
+    [[ "$new" =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})\.0/24$ ]] || { echo "网段格式须为 x.y.z.0/24" >&2; return 1; }
+    prefix=${BASH_REMATCH[1]}
+    old_prefix=$(subnet_prefix)
+    [[ "$prefix" == "$old_prefix" ]] && { echo "网段已是 $new，无需修改"; return 0; }
+    # 仅接受私有/CGNAT 网段（CGNAT 第二段为 64-127）
+    case "$prefix" in
+        10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) ;;
+        *) echo "警告：$new 不是私有/CGNAT 网段，仍将继续" >&2 ;;
+    esac
+    state_set --arg sn "$new" --arg p "$prefix" \
+        '.server.subnet = $sn
+         | .server.server_ip = ($p + ".254")
+         | .clients |= map(.ip = ($p + "." + (.ip | split(".") | .[3])))
+         | .tombstones = []'
+    write_server_config
+    restart_awg
+    regen_all_client_configs
+    echo "网段已改为 $new（各客户端主机位不变，服务端为 $prefix.254）"
+    echo "旧网段墓碑已清空（旧 IP 在新网段无意义），全部客户端配置已重新生成，请重新下载并导入"
+}
+
+set_endpoint() {
+    local ep=$1
+    [[ -n "$ep" ]] || { echo "Endpoint 不能为空" >&2; return 1; }
+    state_set --arg e "$ep" '.server.endpoint = $e'
+    regen_all_client_configs
+    echo "Endpoint 已改为 $ep，全部客户端配置已重新生成，请重新下载并导入"
+}
+
+set_dns() {
+    local dns=$1
+    [[ "$dns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "DNS 须为 IPv4 地址" >&2; return 1; }
+    state_set --arg d "$dns" '.server.dns = $d'
+    local n
+    while IFS= read -r n; do write_client_config "$n" >/dev/null; done \
+        < <(jq -r '.clients[] | select(.full_tunnel == true) | .name' "$STATE_FILE")
+    echo "全量客户端 DNS 已改为 $dns（分流客户端不受影响），相关配置已重新生成"
+}
+
+regen_obfuscation() {
+    local obf
+    obf=$(gen_obfuscation_json) || die "混淆参数生成失败"
+    state_set --argjson o "$obf" '.server.obfuscation = $o'
+    write_server_config
+    restart_awg
+    regen_all_client_configs
+    echo "混淆参数已重新生成，全部客户端配置已重新生成，请重新下载并导入（旧配置全部失效）"
+}
+
+# ---------- 备份与恢复 ----------
+do_backup() {
+    local ts path
+    ts=$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$BACKUP_DIR"
+    path="$BACKUP_DIR/awg-backup-$ts.tar.gz"
+    tar -czf "$path" -C / root/awg/state.json root/awg/clients etc/amnezia/amneziawg/awg0.conf 2>/dev/null \
+        || die "备份打包失败"
+    chmod 600 "$path"
+    echo "备份已保存：$path"
+    echo "（含状态文件、全部客户端配置与服务端配置；恢复时用 awgman 备份菜单或 awgman restore <文件>）"
+}
+
+do_restore() {
+    local file=$1 tmp
+    [[ -f "$file" ]] || { echo "备份文件不存在：$file" >&2; return 1; }
+    tmp=$(mktemp -d) || die "无法创建临时目录"
+    tar -xzf "$file" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; echo "备份文件无法解压" >&2; return 1; }
+    [[ -f "$tmp/root/awg/state.json" ]] || { rm -rf "$tmp"; echo "备份中没有状态文件" >&2; return 1; }
+    jq -e . "$tmp/root/awg/state.json" >/dev/null 2>&1 || { rm -rf "$tmp"; echo "备份中的状态文件损坏" >&2; return 1; }
+    systemctl stop "awg-quick@$IFACE" 2>/dev/null || true
+    mkdir -p "$STATE_DIR" "$CLIENT_DIR" "$(dirname "$SERVER_CONF")"
+    cp "$tmp/root/awg/state.json" "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+    rm -rf "$CLIENT_DIR"
+    cp -r "$tmp/root/awg/clients" "$CLIENT_DIR" 2>/dev/null || mkdir -p "$CLIENT_DIR"
+    chmod 700 "$CLIENT_DIR"
+    chmod 600 "$CLIENT_DIR"/* 2>/dev/null || true
+    rm -rf "$tmp"
+    # 换机器恢复时外网网卡可能不同，重新检测
+    local ext_if
+    ext_if=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    [[ -n "$ext_if" ]] && state_set --arg e "$ext_if" '.server.ext_if = $e'
+    # 重新放行 AWG 端口
+    local port
+    port=$(server_field port)
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port/udp" >/dev/null 2>&1 || true
+    fi
+    write_server_config
+    regen_all_client_configs
+    systemctl enable --now "awg-quick@$IFACE" || die "服务启动失败，请查看日志"
+    echo "恢复完成，服务已启动"
+}
+
+# ---------- 更新与卸载 ----------
+awg_versions() {
+    echo "amneziawg-tools：$(awg --version 2>/dev/null | head -n1 || echo 未安装)"
+    if lsmod 2>/dev/null | grep -q '^amneziawg'; then
+        echo "内核模块：$(modinfo amneziawg 2>/dev/null | awk -F': ' '/^version/{print $2}')（已加载）"
+    elif command -v amneziawg-go >/dev/null 2>&1; then
+        echo "用户态：amneziawg-go $(amneziawg-go --version 2>/dev/null || echo 已安装)"
+    else
+        echo "内核模块：未加载（awg-quick 将自动 fallback 到 amneziawg-go，如已安装）"
+    fi
+}
+
+do_update() {
+    echo "当前版本："
+    awg_versions
+    echo ""
+    echo "正在检查更新..."
+    apt-get update -qq 2>&1 | tail -n 2
+    apt-get install -y --only-upgrade amneziawg-dkms amneziawg-tools 2>&1 | tail -n 5
+    if command -v amneziawg-go >/dev/null 2>&1; then
+        echo "正在更新 amneziawg-go..."
+        local tmp
+        tmp=$(mktemp)
+        if curl -fsSL -o "$tmp" "https://github.com/amnezia-vpn/amneziawg-go/releases/latest/download/amneziawg-go-linux-amd64"; then
+            install -m 755 "$tmp" /usr/local/bin/amneziawg-go
+            echo "amneziawg-go 已更新"
+        else
+            warn "amneziawg-go 下载失败，保留旧版"
+        fi
+        rm -f "$tmp"
+    fi
+    modprobe amneziawg 2>/dev/null || true
+    restart_awg
+    echo ""
+    echo "更新后版本："
+    awg_versions
+}
+
+do_uninstall() {
+    local port
+    port=$(server_field port)
+    echo "正在备份当前状态..."
+    do_backup
+    systemctl stop "awg-quick@$IFACE" 2>/dev/null || true
+    systemctl disable "awg-quick@$IFACE" 2>/dev/null || true
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "$port/udp" >/dev/null 2>&1 || true
+    fi
+    rm -rf /etc/amnezia/amneziawg "$CLIENT_DIR" "$STATE_FILE" "$LOCK_FILE"
+    echo "已删除 AWG 配置与状态（备份保留在 $BACKUP_DIR）"
+    echo "如需删除软件包与 PPA，请手动执行："
+    echo "  apt-get remove -y amneziawg-dkms amneziawg-tools"
+    echo "  rm -f /etc/apt/sources.list.d/amnezia.list /etc/apt/keyrings/amnezia.asc"
+}
+
+# ---------- CLI ----------
+cmd_help() {
+    cat <<'EOF'
+用法：awgman [命令] [参数]
+  无参数进入全屏 TUI 菜单；有参数时为非交互 CLI。
+
+客户端：
+  add <名> [备注] [IP|auto] [split|full] [--force]  添加客户端（默认自动分配 IP、分流）
+  del <名>                    删除客户端（IP 记入墓碑）
+  list                        列出客户端
+  show <名>                   显示客户端配置与一键安装命令
+  enable <名> / disable <名>  启用 / 禁用客户端
+  remark <名> <备注>          修改备注
+  tunnel <名> <split|full>    分流 / 全量切换
+  regen-keys <名>             重新生成客户端密钥
+  regen-all                   重新生成全部客户端配置
+  release-tombstones          释放已删除客户端的 IP（可再次分配）
+
+网络：
+  port <端口|random>          修改监听端口（重发全部配置）
+  subnet <x.y.z.0/24|random>  修改内网网段（主机位不变，墓碑清空；random 取 CGNAT）
+  endpoint <域名或IP>         修改客户端 Endpoint
+  dns <IP>                    修改全量客户端 DNS
+  regen-obfuscation           重新生成混淆参数（全部配置失效）
+
+查看与维护：
+  topology                    星型拓扑
+  status                      接口与握手状态
+  versions                    AWG 组件版本
+  backup                      备份状态与配置
+  restore <文件>              从备份恢复
+  update                      更新 AWG 组件
+  uninstall                   卸载（先自动备份）
+EOF
+}
+
+cli_list() {
+    printf '%-16s %-15s %-8s %-10s %s\n' "名称" "内网 IP" "状态" "模式" "备注"
+    jq -r '.clients[] | [.name, .ip, (if .enabled then "启用" else "禁用" end),
+        (if .full_tunnel then "全量" else "分流" end), (.remark // "")] | @tsv' "$STATE_FILE" \
+        | while IFS=$'\t' read -r n ip en mode r; do
+            printf '%-16s %-15s %-8s %-10s %s\n' "$n" "$ip" "$en" "$mode" "$r"
+        done
+    local t
+    t=$(jq -r '.tombstones | length' "$STATE_FILE")
+    echo "墓碑 IP：$t 个"
+}
+
+cli_dispatch() {
+    local cmd=$1; shift || true
+    case "$cmd" in
+        help|--help|-h) cmd_help; return 0 ;;
+        list|topology|show|status|versions|backup) ;;
+        *) take_lock ;;  # 写操作加锁
+    esac
+    need_state
+    case "$cmd" in
+        add)
+            local name=${1:-} remark=${2:-} ip=${3:-auto} mode=${4:-split} force=0
+            [[ -n "$name" ]] || die "用法：awgman add <名> [备注] [IP|auto] [split|full] [--force]"
+            [[ " $* " == *" --force "* ]] && force=1
+            local full=false; [[ "$mode" == "full" ]] && full=true
+            add_client "$name" "$remark" "$ip" "$full" "$force"
+            local rc=$?
+            if (( rc == 3 )); then
+                echo "该 IP 是已删除客户端的旧 IP，加 --force 可强制使用" >&2
+                return 3
+            fi
+            return $rc
+            ;;
+        del) [[ -n "${1:-}" ]] || die "用法：awgman del <名>"; del_client "$1" ;;
+        list) cli_list ;;
+        show)
+            [[ -n "${1:-}" ]] || die "用法：awgman show <名>"
+            client_exists "$1" || die "客户端不存在：$1"
+            cat "$CLIENT_DIR/$1.conf"
+            echo ""
+            print_install_commands "$1"
+            ;;
+        enable) [[ -n "${1:-}" ]] || die "用法：awgman enable <名>"; set_client_enabled "$1" true ;;
+        disable) [[ -n "${1:-}" ]] || die "用法：awgman disable <名>"; set_client_enabled "$1" false ;;
+        remark) [[ -n "${1:-}" && -n "${2:-}" ]] || die "用法：awgman remark <名> <备注>"; set_client_remark "$1" "$2" ;;
+        tunnel)
+            [[ -n "${1:-}" && -n "${2:-}" ]] || die "用法：awgman tunnel <名> <split|full>"
+            if [[ "$2" == "full" ]]; then set_client_tunnel "$1" true
+            elif [[ "$2" == "split" ]]; then set_client_tunnel "$1" false
+            else die "模式须为 split 或 full"; fi
+            ;;
+        regen-keys) [[ -n "${1:-}" ]] || die "用法：awgman regen-keys <名>"; regen_client_keys "$1" ;;
+        regen-all) regen_all_client_configs; echo "全部客户端配置已重新生成" ;;
+        release-tombstones) release_tombstones ;;
+        port) [[ -n "${1:-}" ]] || die "用法：awgman port <端口|random>"; set_port "$1" ;;
+        subnet) [[ -n "${1:-}" ]] || die "用法：awgman subnet <x.y.z.0/24|random>"; set_subnet "$1" ;;
+        endpoint) [[ -n "${1:-}" ]] || die "用法：awgman endpoint <域名或IP>"; set_endpoint "$1" ;;
+        dns) [[ -n "${1:-}" ]] || die "用法：awgman dns <IP>"; set_dns "$1" ;;
+        regen-obfuscation) regen_obfuscation ;;
+        topology) topology_text ;;
+        status)
+            echo "服务：$(systemctl is-active "awg-quick@$IFACE" 2>/dev/null || echo 未运行)"
+            awg show "$IFACE" 2>&1
+            ;;
+        versions) awg_versions ;;
+        backup) do_backup ;;
+        restore) [[ -n "${1:-}" ]] || die "用法：awgman restore <备份文件>"; do_restore "$1" ;;
+        update) do_update ;;
+        uninstall) do_uninstall ;;
+        *) echo "未知命令：$cmd" >&2; cmd_help >&2; return 1 ;;
+    esac
+}
+
+# ---------- TUI ----------
+WT_TITLE="AmneziaWG 3.1 管理 v$VERSION"
+WT_H=20 WT_W=72 WT_MENU_H=10
+
+# 终端尺寸：每次显示前重新检测，菜单铺满全屏（留 1 行 2 列边距）
+wt_size() {
+    local lines cols
+    lines=$(tput lines 2>/dev/null || stty size 2>/dev/null | cut -d' ' -f1)
+    cols=$(tput cols 2>/dev/null || stty size 2>/dev/null | cut -d' ' -f2)
+    [[ "$lines" =~ ^[0-9]+$ ]] && (( lines >= 15 )) || lines=24
+    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols >= 60 )) || cols=80
+    WT_H=$((lines - 1))
+    WT_W=$((cols - 2))
+    # newt 规则：菜单显示行数超过 对话框高-7-提示行数 时，提示文字会被逐行吞掉；
+    # 主菜单提示是 2 行，按最严的留 9 行（39 行对话框实测：31 只剩首行，30 两行都在）
+    WT_MENU_H=$((WT_H - 9))
+    (( WT_MENU_H < 5 )) && WT_MENU_H=5
+}
+
+wt_msg() { # wt_msg <标题> <文本>
+    wt_size
+    whiptail --title "$1" --msgbox "$2" "$WT_H" "$WT_W" 2>/dev/null || true
+}
+
+wt_textbox() { # wt_textbox <标题> <文本>：滚动查看长文本
+    local title=$1 text=$2 tmp
+    wt_size
+    tmp=$(mktemp)
+    printf '%s\n' "$text" >"$tmp"
+    whiptail --title "$title" --textbox "$tmp" "$WT_H" "$WT_W" 2>/dev/null || true
+    rm -f "$tmp"
+}
+
+wt_yesno() { # wt_yesno <文本>：返回 0=是
+    wt_size
+    whiptail --title "$WT_TITLE" --yesno "$1" 10 "$WT_W" 2>/dev/null
+}
+
+# 客户端选择菜单：wt_pick_client <提示>，输出选中的名，取消返回 1
+wt_pick_client() {
+    local items=() choice
+    while IFS=$'\t' read -r n ip r en; do
+        local st="启用"; [[ "$en" != "true" ]] && st="已禁用"
+        items+=("$n" "$ip $r [$st]")
+    done < <(jq -r '.clients[] | [.name, .ip, (.remark // ""), (.enabled | tostring)] | @tsv' "$STATE_FILE")
+    (( ${#items[@]} == 0 )) && { wt_msg "提示" "暂无客户端"; return 1; }
+    choice=$(whiptail --title "$WT_TITLE" --menu "$1" "$WT_H" "$WT_W" "$WT_MENU_H" "${items[@]}" 3>&1 1>&2 2>&3) || return 1
+    echo "$choice"
+}
+
+tui_add_client() {
+    local name remark ip mode full rc out tomb
+    while true; do
+        wt_size
+        name=$(whiptail --title "添加客户端" --inputbox "客户端名称（字母数字开头，仅含字母、数字、_、-，最长 15 字符）：\n名称会成为配置文件名与服务名" 12 "$WT_W" "" 3>&1 1>&2 2>&3) || return 0
+        if valid_name "$name"; then
+            if client_exists "$name"; then
+                wt_msg "提示" "客户端已存在：$name"
+            else
+                break
+            fi
+        else
+            wt_msg "提示" "名称不合法：须以字母数字开头，仅含字母、数字、下划线、连字符，最长 15 字符"
+        fi
+    done
+    remark=$(whiptail --title "添加客户端" --inputbox "备注（支持中文，用于拓扑中识别这台机器，可留空）：" 10 "$WT_W" "" 3>&1 1>&2 2>&3) || return 0
+    local def_ip
+    def_ip=$(next_free_ip) || { wt_msg "提示" "地址池已耗尽，请先用「释放已删除客户端的 IP」清理墓碑"; return 0; }
+    ip=$(whiptail --title "添加客户端" --inputbox "内网地址（直接回车使用默认分配，或输入自定义地址）：\n注意：分配后永久固定给该客户端，删除后也不复用" 12 "$WT_W" "$def_ip" 3>&1 1>&2 2>&3) || return 0
+    [[ -z "$ip" ]] && ip="$def_ip"
+    mode=$(whiptail --title "添加客户端" --menu "流量模式：" 12 "$WT_W" 2 \
+        "split" "分流：仅内网网段走隧道（默认，同 Netmaker）" \
+        "full" "全量：全部流量走隧道，推送 DNS" 3>&1 1>&2 2>&3) || return 0
+    full=false; [[ "$mode" == "full" ]] && full=true
+    wt_yesno "确认添加客户端？\n\n名称：$name\n备注：${remark:-（无）}\n内网地址：$ip\n模式：$([ "$full" == true ] && echo 全量 || echo 分流)" || return 0
+    out=$(add_client "$name" "$remark" "$ip" "$full" 0 2>&1); rc=$?
+    if (( rc == 3 )); then
+        tomb=${out#TOMBSTONE:}
+        if wt_yesno "该 IP 曾分配给已删除的客户端：\n$tomb\n\n确定要把它分配给 $name 吗？"; then
+            out=$(add_client "$name" "$remark" "$ip" "$full" 1 2>&1); rc=$?
+        else
+            return 0
+        fi
+    fi
+    if (( rc != 0 )); then
+        wt_msg "失败" "$out"
+        return 0
+    fi
+    wt_textbox "客户端已添加" "$out
+
+$(print_install_commands "$name")
+
+配置已保存到 $CLIENT_DIR/$name.conf
+请下载该文件并上传到客户端，再运行上面的命令安装为系统服务。"
+}
+
+tui_del_client() {
+    local name c ip
+    name=$(wt_pick_client "选择要删除的客户端：") || return 0
+    c=$(jq -c --arg n "$name" '.clients[] | select(.name == $n)' "$STATE_FILE")
+    ip=$(jq -r '.ip' <<<"$c")
+    wt_yesno "确定删除客户端 $name（$ip）吗？\n\n删除后：\n- 服务端立即撤销其接入\n- 其配置文件将被删除\n- 其 IP $ip 记入墓碑，不再自动分配" || return 0
+    local out
+    out=$(del_client "$name" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+}
+
+tui_toggle_client() {
+    local name en
+    name=$(wt_pick_client "选择要启用/禁用的客户端：") || return 0
+    en=$(jq -r --arg n "$name" '.clients[] | select(.name == $n) | .enabled' "$STATE_FILE")
+    local out
+    if [[ "$en" == "true" ]]; then
+        wt_yesno "禁用客户端 $name？\n禁用后服务端立即撤销其接入，配置保留，可随时再启用。" || return 0
+        out=$(set_client_enabled "$name" false 2>&1)
+    else
+        out=$(set_client_enabled "$name" true 2>&1)
+    fi
+    wt_msg "完成" "$out"
+}
+
+tui_remark_client() {
+    local name old remark
+    name=$(wt_pick_client "选择要修改备注的客户端：") || return 0
+    old=$(jq -r --arg n "$name" '.clients[] | select(.name == $n) | .remark // ""' "$STATE_FILE")
+    remark=$(whiptail --title "修改备注" --inputbox "新备注（支持中文）：" 10 "$WT_W" "$old" 3>&1 1>&2 2>&3) || return 0
+    local out
+    out=$(set_client_remark "$name" "$remark" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+}
+
+tui_tunnel_client() {
+    local name full mode
+    name=$(wt_pick_client "选择要切换流量模式的客户端：") || return 0
+    full=$(jq -r --arg n "$name" '.clients[] | select(.name == $n) | .full_tunnel' "$STATE_FILE")
+    mode=$(whiptail --title "流量模式" --menu "当前模式：$([ "$full" == true ] && echo 全量 || echo 分流)" 12 "$WT_W" 2 \
+        "split" "分流：仅内网网段走隧道" \
+        "full" "全量：全部流量走隧道，推送 DNS" 3>&1 1>&2 2>&3) || return 0
+    local out
+    if [[ "$mode" == "full" ]]; then out=$(set_client_tunnel "$name" true 2>&1)
+    else out=$(set_client_tunnel "$name" false 2>&1); fi
+    wt_msg "完成" "$out"
+}
+
+tui_regen_keys() {
+    local name
+    name=$(wt_pick_client "选择要重新生成密钥的客户端（旧配置立即失效）：") || return 0
+    wt_yesno "确定重新生成 $name 的密钥吗？\n旧配置立即失效，需重新下载配置并导入。" || return 0
+    local out
+    out=$(regen_client_keys "$name" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+}
+
+tui_show_client() {
+    local name
+    name=$(wt_pick_client "选择要查看的客户端：") || return 0
+    wt_textbox "客户端 $name" "$(cat "$CLIENT_DIR/$name.conf" 2>/dev/null)
+
+$(print_install_commands "$name")"
+}
+
+tui_clients() {
+    local choice
+    while true; do
+        wt_size
+        choice=$(whiptail --title "$WT_TITLE" --menu "客户端管理" "$WT_H" "$WT_W" "$WT_MENU_H" \
+            "1" "添加客户端" \
+            "2" "删除客户端" \
+            "3" "启用 / 禁用客户端" \
+            "4" "修改备注" \
+            "5" "分流 / 全量切换" \
+            "6" "重新生成客户端密钥" \
+            "7" "查看客户端配置与安装命令" \
+            "8" "释放已删除客户端的 IP" \
+            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+        case "$choice" in
+            1) tui_add_client ;;
+            2) tui_del_client ;;
+            3) tui_toggle_client ;;
+            4) tui_remark_client ;;
+            5) tui_tunnel_client ;;
+            6) tui_regen_keys ;;
+            7) tui_show_client ;;
+            8)
+                local n
+                n=$(jq -r '.tombstones | length' "$STATE_FILE")
+                if (( n == 0 )); then wt_msg "提示" "没有墓碑 IP 可释放"
+                elif wt_yesno "释放 $n 个墓碑 IP？\n释放后这些 IP 可再次自动分配给新客户端。"; then
+                    wt_msg "完成" "$(release_tombstones)"
+                fi
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+tui_network_info() {
+    local o
+    o=$(state_get '.server.obfuscation | to_entries[] | "\(.key) = \(.value)"' | paste -sd'\n' -)
+    wt_textbox "网络配置" "内网网段：$(server_field subnet)
+服务端地址：$(server_ip)
+监听端口：$(server_field port)/udp
+客户端 Endpoint：$(server_field endpoint)
+全量客户端 DNS：$(server_field dns)
+MTU：$(server_field mtu)
+外网网卡：$(server_field ext_if)
+服务端公钥：$(server_field public_key)
+
+混淆参数（3.1，两端一致）：
+$o"
+}
+
+tui_network() {
+    local choice
+    while true; do
+        wt_size
+        choice=$(whiptail --title "$WT_TITLE" --menu "网络设置" "$WT_H" "$WT_W" "$WT_MENU_H" \
+            "1" "查看网络配置" \
+            "2" "修改监听端口" \
+            "3" "修改内网网段" \
+            "4" "修改 Endpoint 域名" \
+            "5" "修改全量客户端 DNS" \
+            "6" "重新生成混淆参数" \
+            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+        case "$choice" in
+            1) tui_network_info ;;
+            2)
+                local mode p
+                mode=$(whiptail --title "修改监听端口" --menu "当前端口：$(server_field port)/udp" 11 "$WT_W" 2 \
+                    "random" "随机端口（10000-60000）" \
+                    "custom" "自定义端口" 3>&1 1>&2 2>&3) || continue
+                if [[ "$mode" == "random" ]]; then
+                    p=$(rand_port)
+                else
+                    p=$(whiptail --title "修改监听端口" --inputbox "新端口（1-65535；修改后全部客户端配置需重新下载导入）：" 11 "$WT_W" "$(server_field port)" 3>&1 1>&2 2>&3) || continue
+                fi
+                if [[ "$p" == "$(server_field port)" ]]; then
+                    wt_msg "提示" "端口未改变（仍为 $p）"
+                    continue
+                fi
+                wt_yesno "确定把监听端口改为 $p 吗？\n服务将重启，全部客户端配置需重新下载导入。" || continue
+                local out; out=$(set_port "$p" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            3)
+                local mode s
+                mode=$(whiptail --title "修改内网网段" --menu "当前网段：$(server_field subnet)" 11 "$WT_W" 2 \
+                    "random" "随机 CGNAT 网段（100.64.0.0/10 内）" \
+                    "custom" "自定义网段" 3>&1 1>&2 2>&3) || continue
+                if [[ "$mode" == "random" ]]; then
+                    s=$(rand_subnet)
+                else
+                    s=$(whiptail --title "修改内网网段" --inputbox "新网段（x.y.z.0/24；各客户端主机位不变，墓碑清空，全部配置需重下）：" 11 "$WT_W" "$(server_field subnet)" 3>&1 1>&2 2>&3) || continue
+                fi
+                if [[ "$s" == "$(server_field subnet)" ]]; then
+                    wt_msg "提示" "网段未改变（仍为 $s）"
+                    continue
+                fi
+                wt_yesno "确定把网段改为 $s 吗？\n服务将重启，全部客户端配置需重新下载导入。" || continue
+                local out; out=$(set_subnet "$s" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            4)
+                local e
+                e=$(whiptail --title "修改 Endpoint" --inputbox "客户端连接用的域名或 IP：" 10 "$WT_W" "$(server_field endpoint)" 3>&1 1>&2 2>&3) || continue
+                local out; out=$(set_endpoint "$e" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            5)
+                local d
+                d=$(whiptail --title "修改 DNS" --inputbox "全量客户端推送的 DNS：" 10 "$WT_W" "$(server_field dns)" 3>&1 1>&2 2>&3) || continue
+                local out; out=$(set_dns "$d" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            6)
+                wt_yesno "确定重新生成混淆参数吗？\n\n警告：生成后全部客户端配置立即失效，必须重新下载并导入，否则连不上。" || continue
+                local out; out=$(regen_obfuscation 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+tui_status() {
+    local txt svc
+    svc="○ 未运行"
+    systemctl is-active --quiet "awg-quick@$IFACE" 2>/dev/null && svc="● 运行中"
+    txt="服务状态：$svc　服务端：$(server_ip)　端口：$(server_field port)/udp　网段：$(server_field subnet)
+$(awg_versions)
+
+$(awg show "$IFACE" 2>&1)"
+    wt_textbox "状态查看" "$txt"
+}
+
+tui_backup() {
+    local choice
+    while true; do
+        wt_size
+        choice=$(whiptail --title "$WT_TITLE" --menu "备份与恢复（备份在 $BACKUP_DIR）" "$WT_H" "$WT_W" "$WT_MENU_H" \
+            "1" "创建备份" \
+            "2" "查看已有备份" \
+            "3" "从备份恢复" \
+            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+        case "$choice" in
+            1) wt_msg "完成" "$(do_backup 2>&1)" ;;
+            2)
+                local list
+                list=$(ls -lh "$BACKUP_DIR" 2>/dev/null | tail -n +2 || echo "暂无备份")
+                wt_textbox "已有备份" "$list"
+                ;;
+            3)
+                local items=() f
+                while IFS= read -r f; do
+                    [[ -n "$f" ]] && items+=("$f" "$(stat -c '%y %s' "$BACKUP_DIR/$f" 2>/dev/null | cut -c1-16)")
+                done < <(ls "$BACKUP_DIR" 2>/dev/null)
+                (( ${#items[@]} == 0 )) && { wt_msg "提示" "暂无备份"; continue; }
+                f=$(whiptail --title "从备份恢复" --menu "选择备份文件（恢复将覆盖当前状态与配置）：" "$WT_H" "$WT_W" "$WT_MENU_H" "${items[@]}" 3>&1 1>&2 2>&3) || continue
+                wt_yesno "确定从 $f 恢复吗？\n当前状态与配置将被覆盖。" || continue
+                local out; out=$(do_restore "$BACKUP_DIR/$f" 2>&1) && wt_msg "完成" "$out" || wt_msg "失败" "$out"
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+tui_system() {
+    local choice
+    while true; do
+        wt_size
+        choice=$(whiptail --title "$WT_TITLE" --menu "系统工具" "$WT_H" "$WT_W" "$WT_MENU_H" \
+            "1" "查看服务日志" \
+            "2" "重启服务" \
+            "3" "更新 AWG 组件" \
+            "4" "卸载 AWG" \
+            "0" "返回" 3>&1 1>&2 2>&3) || return 0
+        case "$choice" in
+            1) wt_textbox "服务日志" "$(journalctl -u "awg-quick@$IFACE" -n 100 --no-pager 2>&1)" ;;
+            2)
+                if restart_awg 2>&1; then wt_msg "完成" "服务已重启"; else wt_msg "失败" "服务重启失败，请查看日志"; fi
+                ;;
+            3)
+                wt_yesno "更新 AWG 组件（amneziawg-dkms / amneziawg-tools / amneziawg-go）？\n更新后服务将重启。" || continue
+                local out
+                out=$(do_update 2>&1)
+                wt_textbox "更新结果" "$out"
+                ;;
+            4)
+                wt_yesno "确定卸载 AWG 吗？\n将停止服务并删除配置与状态（卸载前会自动创建备份）。" || continue
+                wt_yesno "再次确认：真的要卸载吗？" || continue
+                local out
+                out=$(do_uninstall 2>&1)
+                wt_msg "完成" "$out
+管理工具本身仍在 /usr/local/bin/awgman，可手动删除。"
+                ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+tui_main() {
+    local choice svc
+    while true; do
+        wt_size
+        svc="○ 未运行"
+        systemctl is-active --quiet "awg-quick@$IFACE" 2>/dev/null && svc="● 运行中"
+        choice=$(whiptail --title "$WT_TITLE" --menu \
+            "服务端：$(server_ip)　端口：$(server_field port)/udp　网段：$(server_field subnet)\n客户端：$(jq -r '.clients | length' "$STATE_FILE") 个　服务：$svc" \
+            "$WT_H" "$WT_W" "$WT_MENU_H" \
+            "1" "客户端管理" \
+            "2" "查看拓扑" \
+            "3" "网络设置" \
+            "4" "状态查看" \
+            "5" "备份与恢复" \
+            "6" "系统工具" \
+            "0" "退出" 3>&1 1>&2 2>&3) || break
+        case "$choice" in
+            1) tui_clients ;;
+            2) wt_textbox "星型拓扑" "$(topology_text)" ;;
+            3) tui_network ;;
+            4) tui_status ;;
+            5) tui_backup ;;
+            6) tui_system ;;
+            0) break ;;
+        esac
+    done
+}
+
+# ---------- 主入口 ----------
+main() {
+    need_root
+    if [[ $# -eq 0 ]]; then
+        need_state
+        take_lock
+        tui_main
+    else
+        cli_dispatch "$@"
+    fi
+}
+
+# 直接执行时进入主入口；被 install.sh source 时只加载函数
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

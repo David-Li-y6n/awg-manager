@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock ufw（仅供 awgman 测试）：记录调用，status 报告 active。
+echo "ufw $*" >> "${MOCK_LOG:-/tmp/awg-test-mock.log}"
+if [[ "${1:-}" == "status" ]]; then echo "Status: active"; fi
+exit 0
