@@ -1,6 +1,7 @@
 # AWG 3.1 命令行管理工具 — 设计文档
 
-用户需求整理（2026-11-23 02:57–03:01），待用户确认后开始实现。
+用户需求整理（2026-11-23 02:57–03:01），已实现并部署上线（2026-11-23 03:40）。
+本文档记录最初的需求与架构决策，实现细节以代码与 README 为准。
 
 ## 目标
 
@@ -53,14 +54,16 @@ Netmaker（服务端加客户端、改网络都很方便）。
 
 - 专门目录存放（如 /root/awg/clients/），目录 0700、配置文件 0600，方便下载。
 - 每个客户端生成 .conf + 二维码 PNG（手机扫码用）。
-- 增加客户端后打印一键安装命令（利用已上传到客户端的配置文件本地安装，
-  不做下发；用户自己从目录下载配置并上传到客户端）。
-  - Windows（管理员）：amneziawg.exe /installtunnelservice "<配置路径>"
-    （服务名 AmneziaWGTunnel$<名>，开机自动启动自动连接；默认假设配置在
-    下载文件夹，路径可改）。
-  - Linux：sudo cp <名>.conf /etc/amnezia/amneziawg/ && sudo systemctl enable --now
-    awg-quick@<名>（需已装 amneziawg-tools）。
-  - 客户端名称需符合网卡名规范（无空格/中文等，TUI 校验或自动规范化），
+- 增加客户端后生成一键安装脚本（利用已上传到客户端的配置文件本地安装，
+  不做下发；用户自己从目录下载配置与脚本并上传到客户端）。
+  - Linux：`<名>-install.sh`，自动检测并安装 amneziawg-tools（未装时从官方
+    PPA 安装），再把配置装好并启动服务。用法：`sudo bash <名>-install.sh`。
+  - Windows（管理员 PowerShell）：`<名>-install.ps1`，调用
+    `amneziawg.exe /installtunnelservice` 把隧道装成 Windows 服务
+    （服务名 AmneziaWGTunnel$<名>，开机自动启动自动连接）。
+  - 不想装后台服务时：用官方 AmneziaWG Windows 客户端图形界面导入 .conf，
+    点 Activate 即可，退出程序隧道即断。
+  - 客户端名称需符合网卡名规范（无空格/中文等，TUI 校验），
     因为 Linux 服务名取自配置文件名。
 - 客户端配置的 Endpoint 默认用域名（hkg3.nexv.me 或 awg.hkg3.nexv.me），
   以后换 IP 只需更新 DNS A 记录，不用重发配置；备选可填 IP。
@@ -91,10 +94,16 @@ Netmaker（服务端加客户端、改网络都很方便）。
 
 ## 实现与测试状态（2026-11-23）
 
-- `install.sh`（419 行）+ `awgman`（1163 行）已写好，bash -n 与 shellcheck
-  通过。测试：管理流程 99 项、安装器 34 项、TUI 冒烟全部通过（见 README）。
+- `install.sh`（510 行）+ `awgman`（1321 行）已写好并部署到 S，bash -n 通过。
+  测试：管理流程 126 项、安装器 34 项、TUI 冒烟全部通过（见 README）。
 - 已实测确认：PPA 提供 amneziawg-tools v3.1.20260812（含全部 3.1 参数）；
   生成的服务端/客户端配置通过真实 3.1 解析器（`awg setconf`）。
+- TUI 已升级：动态全屏尺寸（按终端实际大小铺满）、深色青色主题、
+  拓扑重排（★服务端、●在线/○离线/⊘禁用、分隔线、在线计数、流量↓↑）。
 - 沙箱无法验证（须在 S 上验证）：内核模块加载、接口拉起、真实握手。
 - 已修 bug：jq 对象简写 `{Jc}` 读的是输入字段不是 --argjson 变量（全 null）；
-  jq 字符串插值内嵌套双引号导致 IP 检查静默失效；CGNAT 正则漏 108/109/118/119。
+  jq 字符串插值内嵌套双引号导致 IP 检查静默失效；CGNAT 正则漏 108/109/118/119；
+  awg-quick 配置目录是 /etc/amnezia/amneziawg/（不是 /etc/amneziawg/）；
+  管道掩盖退出码（改用 run_capture）；DKMS 的 dkms.conf 在 src/ 下；
+  amneziawg-go 无预编译包须源码编译；PPA 503 重试；local + set -u 的坑；
+  heredoc 转义的坑；newt 菜单行数过大吞提示文字；tr 截断多字节字符。
