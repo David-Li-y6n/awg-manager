@@ -91,6 +91,9 @@ assert_contains "office-install.sh 含 awg-quick 服务" /root/awg/clients/offic
 assert_contains "office-install.sh 自动安装 tools" /root/awg/clients/office-install.sh "amneziawg-tools，正在从官方 PPA 安装"
 assert_contains "office-install.sh 含 PPA 源" /root/awg/clients/office-install.sh "ppa.launchpadcontent.net/amnezia/ppa"
 assert_contains "office-install.sh 含内核头文件" /root/awg/clients/office-install.sh "linux-headers-"
+assert_contains "office-install.sh 头文件安装限时" /root/awg/clients/office-install.sh "timeout 300 apt-get install"
+assert_contains "office-install.sh 含 amneziawg-go fallback" /root/awg/clients/office-install.sh "amneziawg-go"
+assert_contains "office-install.sh 校验 amneziawg-go 哈希" /root/awg/clients/office-install.sh "AWG_GO_SHA256"
 assert_contains "office-install.sh 自动找同目录配置" /root/awg/clients/office-install.sh 'DIR="$(cd "$(dirname "$0")"'
 assert_contains "office-install.ps1 含 installtunnelservice" /root/awg/clients/office-install.ps1 "/installtunnelservice"
 assert_contains "office-install.ps1 含管理员检查" /root/awg/clients/office-install.ps1 "IsInRole"

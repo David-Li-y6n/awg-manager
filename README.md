@@ -231,7 +231,9 @@ sudo bash <名>-install.sh
 ```
 
 脚本会先检测有没有装 `amneziawg-tools`，没装就自动从官方 PPA 安装
-（含内核头文件、DKMS 模块），然后把配置装到 `/etc/amnezia/amneziawg/`、
+（含内核头文件、DKMS 模块）；内核头文件安装限时 5 分钟，内核模块加载
+失败时自动改装用户态 `amneziawg-go`（已校验 SHA256，不用改配置）。
+然后把配置装到 `/etc/amnezia/amneziawg/`、
 启用并启动 `awg-quick@<名>` 服务（开机自启）。装好后 `awg show` 能看到握手。
 
 **Windows**（先装好 AmneziaWG 客户端，再把 `.conf` 与 `.ps1` 放到同一目录，

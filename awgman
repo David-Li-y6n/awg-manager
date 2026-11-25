@@ -340,15 +340,40 @@ if ! command -v awg-quick >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates
-    apt-get install -y -qq "linux-headers-\$(uname -r)" 2>/dev/null || echo "注意：内核头文件安装失败，DKMS 可能无法编译"
+    # 内核头文件只给 5 分钟：2026-11-24 sz_aliyun（Debian 12）在这步静默挂了
+    # 13 分钟（-qq 藏了进度、无下载无日志），不是慢，是真 hang；超时只警告，
+    # 不卡死，后面改走用户态模式
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 300 apt-get install -y "linux-headers-\$(uname -r)" || echo "注意：内核头文件安装失败或超时，DKMS 可能无法编译，将改走用户态模式"
+    else
+        apt-get install -y "linux-headers-\$(uname -r)" || echo "注意：内核头文件安装失败，DKMS 可能无法编译，将改走用户态模式"
+    fi
     mkdir -p /etc/apt/keyrings
     curl --retry 3 -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x75C9DD72C799870E310542E24166F2C257290828" -o /etc/apt/keyrings/amnezia.asc
     echo "deb [signed-by=/etc/apt/keyrings/amnezia.asc] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu \$SUITE main" > /etc/apt/sources.list.d/amnezia.list
     apt-get update -qq
     apt-get install -y amneziawg-tools amneziawg-dkms
-    modprobe amneziawg 2>/dev/null || echo "注意：内核模块加载失败，awg-quick 将尝试用户态模式"
     command -v awg-quick >/dev/null 2>&1 || { echo "amneziawg-tools 安装失败"; exit 1; }
     echo "amneziawg-tools 已安装"
+    # 数据面：内核模块优先；加载失败则装用户态 amneziawg-go，
+    # awg-quick 检测到无内核模块会自动 fallback，不用改配置。
+    # （2026-11-24 sz_aliyun 实测：缺模块时服务报 Unknown device type，
+    # 装上 amneziawg-go v3.1.20261116 后即通）
+    if modprobe amneziawg 2>/dev/null || lsmod 2>/dev/null | grep -q '^amneziawg'; then
+        echo "内核模块已加载（内核模式）"
+    elif command -v amneziawg-go >/dev/null 2>&1; then
+        echo "内核模块不可用，已有 amneziawg-go，将走用户态模式"
+    else
+        echo "内核模块不可用，正在安装用户态 amneziawg-go..."
+        AWG_GO_URL="\${AWG_GO_URL:-https://raw.githubusercontent.com/David-Li-y6n/awg-manager/main/bin/amneziawg-go-linux-amd64}"
+        AWG_GO_SHA256="\${AWG_GO_SHA256:-be91dadd5d1d2d1b453873aa1171a62ea1c11d9f7970c466f53a1c3aeece7838}"
+        curl -fsSL --retry 3 -o /tmp/amneziawg-go "\$AWG_GO_URL" || { echo "amneziawg-go 下载失败：请检查网络，或手动安装后重跑本脚本"; exit 1; }
+        echo "\$AWG_GO_SHA256  /tmp/amneziawg-go" | sha256sum -c - || { echo "amneziawg-go 校验失败：下载的文件与记录的 SHA256 不符"; exit 1; }
+        install -m 755 /tmp/amneziawg-go /usr/local/bin/amneziawg-go
+        amneziawg-go --version || { echo "amneziawg-go 安装失败"; exit 1; }
+        rm -f /tmp/amneziawg-go
+        echo "amneziawg-go 已安装（用户态模式）"
+    fi
 fi
 mkdir -p /etc/amnezia/amneziawg
 install -m 600 "\$DIR/\$NAME.conf" "/etc/amnezia/amneziawg/\$NAME.conf"
@@ -357,7 +382,7 @@ sleep 1
 if systemctl is-active --quiet "awg-quick@\$NAME"; then
     echo "已安装并启动：awg-quick@\$NAME（开机自动连接）"
 else
-    echo "服务启动失败：systemctl status awg-quick@\$NAME"
+    echo "服务启动失败：systemctl status awg-quick@\$NAME；若报 Unknown device type，说明内核模块与 amneziawg-go 都没装好"
     exit 1
 fi
 EOF
@@ -781,7 +806,9 @@ do_update() {
         echo "正在更新 amneziawg-go..."
         local tmp
         tmp=$(mktemp)
-        if curl -fsSL -o "$tmp" "https://github.com/amnezia-vpn/amneziawg-go/releases/latest/download/amneziawg-go-linux-amd64"; then
+        # 上游 amneziawg-go 仓库不发布预编译二进制，改从本仓库的 release 取
+        #（与客户端安装脚本同一份二进制，v3.1.20261116）
+        if curl -fsSL -o "$tmp" "https://raw.githubusercontent.com/David-Li-y6n/awg-manager/main/bin/amneziawg-go-linux-amd64"; then
             install -m 755 "$tmp" /usr/local/bin/amneziawg-go
             echo "amneziawg-go 已更新"
         else
